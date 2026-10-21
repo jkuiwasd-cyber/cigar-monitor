@@ -3,7 +3,7 @@ name: Karibik Cigar Stock Monitor
 on:
   schedule:
     # 国际标准时间每小时的第 0 分钟自动执行一次
-    - cron: '0 * * * *'
+- cron: '*/10 * * * *'
   workflow_dispatch: # 支持在 GitHub 网页上手动点击随时测试
 
 jobs:
