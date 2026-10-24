@@ -2,10 +2,11 @@
 """
 Karibik-Shop 古巴雪茄库存与新品监控通知脚本
 支持本地常驻运行与云端（GitHub Actions / Linux Crontab）定时执行。
-检测到新品上架或补货时，自动向 jkuiwasd@gmail.com 发送邮件提醒。
+检测到新品上架、缺货补货或库存数量变化时，自动向 jkuiwasd@gmail.com 发送邮件提醒。
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -44,6 +45,30 @@ HEADERS = {
 # ========================================================
 
 
+def extract_stock_from_raw_text(raw_text: str) -> str:
+    """
+    直接从商品卡片的纯文本中提取 Karibik-Shop 特有的规格与库存表：
+    格式如：'1 CHF 26.10 42 Stk. verfügbar ; 10 CHF 261.00 13 Stk. verfügbar'
+    """
+    if not raw_text:
+        return "未知库存"
+
+    match = re.search(r"Einheit\s+Preis\s+Warenkorb\s+(.*?)\s+Warenkorb anzeigen", raw_text)
+    if match:
+        block = match.group(1)
+        items = [x.strip() for x in re.findall(r".*?verfügbar", block)]
+        if items:
+            return " ; ".join(items)
+        return block.strip()
+
+    # 备用正则：直接抓取所有包含 verfügbar 的片段
+    fallback_items = [x.strip() for x in re.findall(r"(?:\d+\s*Stk\.\s*verfügbar|Momentan nicht verfügbar)", raw_text)]
+    if fallback_items:
+        return " ; ".join(fallback_items)
+
+    return "未显示具体分项库存"
+
+
 def fetch_page_products(page_num: int):
     """抓取单页商品数据"""
     url = BASE_URL.format(page_num)
@@ -72,31 +97,20 @@ def fetch_page_products(page_num: int):
             link_node = p.select_one("a[href]")
             link = link_node["href"] if link_node else url
 
-            # 提取价格与规格
+            # 提取价格区间
             price_node = p.select_one(".price")
             price = price_node.get_text(" ", strip=True) if price_node else "价格未注明"
 
-            # 提取各包装规格的可用库存（如 1支、10支装、25支木盒等）
-            stock_items = []
-            cart_rows = p.select(".product-units-table tr, .units-table tr")
-            if cart_rows:
-                for row in cart_rows:
-                    unit_text = row.get_text(" | ", strip=True)
-                    if unit_text:
-                        stock_items.append(unit_text)
-            else:
-                stock_nodes = p.select(".stock, .availability, .out-of-stock")
-                for s in stock_nodes:
-                    stock_items.append(s.get_text(strip=True))
-
-            stock_desc = "; ".join(stock_items) if stock_items else "未显示具体分项库存"
+            # 提取完整文本并用正则精准提取每个包装规格的实时库存数量
+            raw_text = p.get_text(" ", strip=True)
+            stock_desc = extract_stock_from_raw_text(raw_text)
 
             page_data[name] = {
                 "name": name,
                 "url": link,
                 "price": price,
                 "stock": stock_desc,
-                "raw_text": p.get_text(" ", strip=True)
+                "raw_text": raw_text
             }
 
         return page_data
@@ -130,7 +144,7 @@ def diff_inventory(old_inv: dict, new_inv: dict):
     """
     比对两次抓取的库存差异：
     1. new_items: 全新上架的品种
-    2. restocked_items: 由“缺货”变为“有货”或库存数量增加的品种
+    2. restocked_items: 库存状态或数量发生任何变化的品种（含补货、数量增减）
     """
     new_items = []
     restocked_items = []
@@ -141,23 +155,17 @@ def diff_inventory(old_inv: dict, new_inv: dict):
             new_items.append(data)
             continue
 
-        # 2. 检查现有商品库存状态变化（是否有缺货恢复为有货，或者库存增加）
+        # 2. 检查现有商品库存状态或数量变化
         old_data = old_inv[name]
         old_stock = old_data.get("stock", "")
+        # 兼容旧版缓存：如果旧缓存里是“未显示具体分项库存”，自动从旧缓存的 raw_text 中还原真实库存
+        if not old_stock or old_stock == "未显示具体分项库存":
+            old_stock = extract_stock_from_raw_text(old_data.get("raw_text", ""))
+
         new_stock = data.get("stock", "")
 
-        was_unavailable = "nicht verfügbar" in old_stock.lower() or "ausverkauft" in old_stock.lower()
-        now_available = "verfügbar" in new_stock.lower() and not ("momentan nicht verfügbar" in new_stock.lower())
-
-        if was_unavailable and now_available:
-            restocked_items.append({
-                "name": name,
-                "url": data["url"],
-                "price": data["price"],
-                "before": old_stock,
-                "now": new_stock
-            })
-        elif old_stock != new_stock and ("verfügbar" in new_stock.lower()):
+        # 只要具体库存文本（包含各规格数量或可用状态）发生变化，即记录并通知
+        if old_stock != new_stock:
             restocked_items.append({
                 "name": name,
                 "url": data["url"],
@@ -174,7 +182,7 @@ def send_email_alert(new_items, restocked_items):
     if not new_items and not restocked_items:
         return
 
-    subject = f"【古巴雪茄上架提醒】发现 {len(new_items)} 款新品上架 / {len(restocked_items)} 款库存变动"
+    subject = f"【古巴雪茄库存提醒】发现 {len(new_items)} 款新品上架 / {len(restocked_items)} 款库存数量变动"
 
     html_content = f"""
     <html>
@@ -203,7 +211,7 @@ def send_email_alert(new_items, restocked_items):
     if restocked_items:
         html_content += """
         <h3 style="background-color: #e8f4f8; padding: 8px; border-left: 4px solid #5bc0de;">
-            🔄 补货 / 重新有货变动（共 {} 款）：
+            🔄 库存数量 / 状态变动（共 {} 款）：
         </h3>
         <ul>
         """.format(len(restocked_items))
@@ -212,7 +220,8 @@ def send_email_alert(new_items, restocked_items):
             <li style="margin-bottom: 12px;">
                 <strong><a href="{item['url']}" style="color: #0066cc; text-decoration: none;">{item['name']}</a></strong><br>
                 <span>💰 价格：{item['price']}</span><br>
-                <span>🔄 变动：从 [{item['before']}] 变为 [<strong>{item['now']}</strong>]</span>
+                <span>📉 之前：[{item['before']}]</span><br>
+                <span>📈 现在：[<strong>{item['now']}</strong>]</span>
             </li>
             """
         html_content += "</ul>"
@@ -274,7 +283,7 @@ def execute_scan_cycle(is_first_run: bool, cached_inventory: dict):
             return False, current_inventory
         else:
             new_items, restocked_items = diff_inventory(cached_inventory, current_inventory)
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 比对结果: 新上架 {len(new_items)} 款, 补货/变动 {len(restocked_items)} 款。")
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 比对结果: 新上架 {len(new_items)} 款, 库存数量变动 {len(restocked_items)} 款。")
 
             if new_items or restocked_items:
                 send_email_alert(new_items, restocked_items)
